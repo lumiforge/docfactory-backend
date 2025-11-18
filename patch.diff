@@ -1,0 +1,1315 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/cmd/api/main.go b/cmd/api/main.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..94ee4ee31cfdcc390ae0fd3deae9e9a97c3001e3
+--- /dev/null
++++ b/cmd/api/main.go
+@@ -0,0 +1,26 @@
++package main
++
++import (
++	"log"
++	"net/http"
++	"os"
++
++	"github.com/lumiforge/docfactory-backend/internal/httpapi"
++	"github.com/lumiforge/docfactory-backend/internal/templates"
++)
++
++func main() {
++	repo := templates.NewInMemoryRepository()
++	service := templates.NewTemplateService(repo)
++	handler := httpapi.NewTemplateHandler(service)
++
++	addr := ":8080"
++	if v := os.Getenv("PORT"); v != "" {
++		addr = ":" + v
++	}
++
++	log.Printf("starting API server on %s", addr)
++	if err := http.ListenAndServe(addr, httpapi.Router(handler)); err != nil {
++		log.Fatalf("server error: %v", err)
++	}
++}
+diff --git a/internal/httpapi/router.go b/internal/httpapi/router.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a6ce5e17d4a01bd02c32cd7906f8a8ff2633547
+--- /dev/null
++++ b/internal/httpapi/router.go
+@@ -0,0 +1,123 @@
++package httpapi
++
++import (
++	"net/http"
++	"strings"
++)
++
++// Router builds HTTP handler using net/http without external deps.
++func Router(handler *TemplateHandler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		path := strings.Trim(r.URL.Path, "/")
++		if path == "" {
++			http.NotFound(w, r)
++			return
++		}
++		segments := strings.Split(path, "/")
++		if segments[0] != "templates" {
++			http.NotFound(w, r)
++			return
++		}
++		switch {
++		case len(segments) == 1:
++			handleTemplatesCollection(handler, w, r)
++		case len(segments) >= 2:
++			if segments[1] == "bulk" {
++				handleTemplatesBulk(handler, w, r, segments[2:])
++				return
++			}
++			ctx := withPathParam(r.Context(), "templateID", segments[1])
++			if len(segments) == 2 {
++				handlerTemplate(handler, w, r.WithContext(ctx))
++				return
++			}
++			switch segments[2] {
++			case "restore":
++				handler.RestoreTemplate(w, r.WithContext(ctx))
++			case "duplicate":
++				handler.DuplicateTemplate(w, r.WithContext(ctx))
++			case "versions":
++				handleVersions(handler, w, r.WithContext(ctx), segments[3:])
++			default:
++				http.NotFound(w, r)
++			}
++		default:
++			http.NotFound(w, r)
++		}
++	})
++}
++
++func handleTemplatesCollection(handler *TemplateHandler, w http.ResponseWriter, r *http.Request) {
++	switch r.Method {
++	case http.MethodGet:
++		handler.ListTemplates(w, r)
++	case http.MethodPost:
++		handler.CreateTemplate(w, r)
++	default:
++		methodNotAllowed(w)
++	}
++}
++
++func handlerTemplate(handler *TemplateHandler, w http.ResponseWriter, r *http.Request) {
++	switch r.Method {
++	case http.MethodGet:
++		handler.GetTemplate(w, r)
++	case http.MethodPut:
++		handler.UpdateTemplate(w, r)
++	case http.MethodDelete:
++		handler.DeleteTemplate(w, r)
++	default:
++		methodNotAllowed(w)
++	}
++}
++
++func handleTemplatesBulk(handler *TemplateHandler, w http.ResponseWriter, r *http.Request, segments []string) {
++	if len(segments) == 0 {
++		http.NotFound(w, r)
++		return
++	}
++	if r.Method != http.MethodPost {
++		methodNotAllowed(w)
++		return
++	}
++	switch segments[0] {
++	case "delete":
++		handler.BulkDelete(w, r)
++	case "export":
++		handler.BulkExport(w, r)
++	case "duplicate":
++		handler.BulkDuplicate(w, r)
++	default:
++		http.NotFound(w, r)
++	}
++}
++
++func handleVersions(handler *TemplateHandler, w http.ResponseWriter, r *http.Request, segments []string) {
++	if len(segments) == 0 {
++		if r.Method == http.MethodGet {
++			handler.ListVersions(w, r)
++			return
++		}
++		methodNotAllowed(w)
++		return
++	}
++	switch segments[0] {
++	case "compare":
++		if r.Method != http.MethodGet {
++			methodNotAllowed(w)
++			return
++		}
++		handler.CompareVersions(w, r)
++	default:
++		if len(segments) == 2 && segments[1] == "restore" && r.Method == http.MethodPost {
++			ctx := withPathParam(r.Context(), "version", segments[0])
++			handler.RestoreVersion(w, r.WithContext(ctx))
++			return
++		}
++		http.NotFound(w, r)
++	}
++}
++
++func methodNotAllowed(w http.ResponseWriter) {
++	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++}
+diff --git a/internal/httpapi/templates_handler.go b/internal/httpapi/templates_handler.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a744be6ba3f866263d4982d74b65ec365c5b203
+--- /dev/null
++++ b/internal/httpapi/templates_handler.go
+@@ -0,0 +1,486 @@
++package httpapi
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/lumiforge/docfactory-backend/internal/templates"
++)
++
++// TemplateHandler wires HTTP requests to template service.
++type TemplateHandler struct {
++	service *templates.TemplateService
++}
++
++// NewTemplateHandler creates HTTP handler.
++func NewTemplateHandler(service *templates.TemplateService) *TemplateHandler {
++	return &TemplateHandler{service: service}
++}
++
++// ListTemplates handles GET /templates.
++func (h *TemplateHandler) ListTemplates(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	limit, offset := paginationFromRequest(r, 50)
++	opt := templates.ListOptions{
++		TenantID: tenantID,
++		Search:   r.URL.Query().Get("search"),
++		Limit:    limit,
++		Offset:   offset,
++	}
++	if docType := r.URL.Query().Get("document_type"); docType != "" {
++		opt.DocumentType = templates.DocumentType(docType)
++	}
++	includeDeleted := r.URL.Query().Get("include_deleted")
++	opt.IncludeDeleted = includeDeleted == "true"
++
++	templatesList, total, err := h.service.ListTemplates(r.Context(), opt)
++	if err != nil {
++		writeError(w, http.StatusInternalServerError, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, map[string]any{
++		"items":  templatesList,
++		"total":  total,
++		"limit":  limit,
++		"offset": offset,
++	})
++}
++
++// GetTemplate handles GET /templates/{id}.
++func (h *TemplateHandler) GetTemplate(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	templateID := pathParam(r, "templateID")
++	tpl, err := h.service.GetTemplate(r.Context(), tenantID, templateID)
++	if err != nil {
++		status := http.StatusInternalServerError
++		if errors.Is(err, templates.ErrNotFound) {
++			status = http.StatusNotFound
++		}
++		writeError(w, status, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, tpl)
++}
++
++// CreateTemplate handles POST /templates.
++func (h *TemplateHandler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	userID := userFromRequest(r)
++	var payload TemplatePayload
++	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	tpl := payload.ToTemplate()
++	tpl.TenantID = tenantID
++	tpl.CreatedBy = userID
++	tpl.UpdatedBy = userID
++	created, err := h.service.CreateTemplate(r.Context(), tpl)
++	if err != nil {
++		status := http.StatusInternalServerError
++		if errors.Is(err, templates.ErrInvalidInput) {
++			status = http.StatusBadRequest
++		}
++		writeError(w, status, err)
++		return
++	}
++	writeJSON(w, http.StatusCreated, created)
++}
++
++// UpdateTemplate handles PUT /templates/{id}.
++func (h *TemplateHandler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	userID := userFromRequest(r)
++	templateID := pathParam(r, "templateID")
++	var payload TemplatePayload
++	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	updated, err := h.service.UpdateTemplate(r.Context(), tenantID, templateID, func(t *templates.Template) error {
++		if payload.Name != "" {
++			t.Name = payload.Name
++		}
++		t.Description = payload.Description
++		if payload.DocumentType != "" {
++			t.DocumentType = payload.DocumentType
++		}
++		if payload.PageSize != "" {
++			t.PageSize = payload.PageSize
++		}
++		if payload.Orientation != "" {
++			t.Orientation = payload.Orientation
++		}
++		if payload.JSONSchemaURL != "" {
++			t.JSONSchemaURL = payload.JSONSchemaURL
++		}
++		if payload.ThumbnailURL != "" {
++			t.ThumbnailURL = payload.ThumbnailURL
++		}
++		return nil
++	}, userID, payload.ChangeSummary)
++	if err != nil {
++		status := http.StatusInternalServerError
++		if errors.Is(err, templates.ErrInvalidInput) {
++			status = http.StatusBadRequest
++		} else if errors.Is(err, templates.ErrNotFound) {
++			status = http.StatusNotFound
++		}
++		writeError(w, status, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, updated)
++}
++
++// DeleteTemplate handles DELETE /templates/{id}.
++func (h *TemplateHandler) DeleteTemplate(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	templateID := pathParam(r, "templateID")
++	if err := h.service.DeleteTemplate(r.Context(), tenantID, templateID); err != nil {
++		status := http.StatusInternalServerError
++		if errors.Is(err, templates.ErrNotFound) {
++			status = http.StatusNotFound
++		}
++		writeError(w, status, err)
++		return
++	}
++	w.WriteHeader(http.StatusNoContent)
++}
++
++// RestoreTemplate handles POST /templates/{id}/restore.
++func (h *TemplateHandler) RestoreTemplate(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	templateID := pathParam(r, "templateID")
++	tpl, err := h.service.RestoreTemplate(r.Context(), tenantID, templateID)
++	if err != nil {
++		status := http.StatusInternalServerError
++		if errors.Is(err, templates.ErrNotFound) {
++			status = http.StatusNotFound
++		}
++		writeError(w, status, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, tpl)
++}
++
++// DuplicateTemplate handles POST /templates/{id}/duplicate.
++func (h *TemplateHandler) DuplicateTemplate(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	templateID := pathParam(r, "templateID")
++	var payload DuplicatePayload
++	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	payload.Defaults(userFromRequest(r))
++	dup, err := h.service.DuplicateTemplate(r.Context(), tenantID, templateID, templates.DuplicateOptions{
++		CreatedBy:           payload.CreatedBy,
++		UpdatedBy:           payload.UpdatedBy,
++		CopyVersions:        payload.CopyVersions,
++		NameOverride:        payload.NameOverride,
++		DescriptionOverride: payload.DescriptionOverride,
++	})
++	if err != nil {
++		status := http.StatusInternalServerError
++		if errors.Is(err, templates.ErrNotFound) {
++			status = http.StatusNotFound
++		}
++		writeError(w, status, err)
++		return
++	}
++	writeJSON(w, http.StatusCreated, dup)
++}
++
++// ListVersions handles GET /templates/{id}/versions.
++func (h *TemplateHandler) ListVersions(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	templateID := pathParam(r, "templateID")
++	versions, err := h.service.ListVersions(r.Context(), tenantID, templateID)
++	if err != nil {
++		status := http.StatusInternalServerError
++		if errors.Is(err, templates.ErrNotFound) {
++			status = http.StatusNotFound
++		}
++		writeError(w, status, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, versions)
++}
++
++// RestoreVersion handles POST /templates/{id}/versions/{version}/restore.
++func (h *TemplateHandler) RestoreVersion(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	templateID := pathParam(r, "templateID")
++	versionParam := pathParam(r, "version")
++	versionNumber, err := strconv.Atoi(versionParam)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, errors.New("version must be integer"))
++		return
++	}
++	restored, err := h.service.RestoreVersion(r.Context(), tenantID, templateID, versionNumber)
++	if err != nil {
++		status := http.StatusInternalServerError
++		if errors.Is(err, templates.ErrNotFound) {
++			status = http.StatusNotFound
++		}
++		writeError(w, status, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, restored)
++}
++
++// CompareVersions handles GET /templates/{id}/versions/compare.
++func (h *TemplateHandler) CompareVersions(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	templateID := pathParam(r, "templateID")
++	left, right := r.URL.Query().Get("left"), r.URL.Query().Get("right")
++	leftVersion, err := strconv.Atoi(left)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, errors.New("left is required integer"))
++		return
++	}
++	rightVersion, err := strconv.Atoi(right)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, errors.New("right is required integer"))
++		return
++	}
++	comparison, err := h.service.CompareVersions(r.Context(), tenantID, templateID, leftVersion, rightVersion)
++	if err != nil {
++		status := http.StatusInternalServerError
++		if errors.Is(err, templates.ErrNotFound) {
++			status = http.StatusNotFound
++		}
++		writeError(w, status, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, comparison)
++}
++
++// BulkDelete handles POST /templates/bulk/delete.
++func (h *TemplateHandler) BulkDelete(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	var payload BulkIDsPayload
++	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	result := BulkResult{Succeeded: []string{}, Failed: map[string]string{}}
++	for _, id := range payload.TemplateIDs {
++		if err := h.service.DeleteTemplate(r.Context(), tenantID, id); err != nil {
++			result.Failed[id] = err.Error()
++		} else {
++			result.Succeeded = append(result.Succeeded, id)
++		}
++	}
++	writeJSON(w, http.StatusMultiStatus, result)
++}
++
++// BulkExport handles POST /templates/bulk/export.
++func (h *TemplateHandler) BulkExport(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	_ = tenantID
++	var payload BulkIDsPayload
++	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	exportID := "export-" + strconv.FormatInt(time.Now().Unix(), 10)
++	writeJSON(w, http.StatusAccepted, map[string]any{
++		"export_id":    exportID,
++		"template_ids": payload.TemplateIDs,
++		"status":       "scheduled",
++	})
++}
++
++// BulkDuplicate handles POST /templates/bulk/duplicate.
++func (h *TemplateHandler) BulkDuplicate(w http.ResponseWriter, r *http.Request) {
++	tenantID, err := tenantFromRequest(r)
++	if err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	userID := userFromRequest(r)
++	var payload BulkDuplicatePayload
++	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
++		writeError(w, http.StatusBadRequest, err)
++		return
++	}
++	result := BulkResult{Succeeded: []string{}, Failed: map[string]string{}}
++	for _, id := range payload.TemplateIDs {
++		dup, err := h.service.DuplicateTemplate(r.Context(), tenantID, id, templates.DuplicateOptions{
++			CreatedBy:    userID,
++			UpdatedBy:    userID,
++			CopyVersions: payload.CopyVersions,
++		})
++		if err != nil {
++			result.Failed[id] = err.Error()
++			continue
++		}
++		result.Succeeded = append(result.Succeeded, dup.TemplateID)
++	}
++	writeJSON(w, http.StatusMultiStatus, result)
++}
++
++// Helper structures
++
++type TemplatePayload struct {
++	Name          string                 `json:"name"`
++	Description   string                 `json:"description"`
++	DocumentType  templates.DocumentType `json:"document_type"`
++	PageSize      templates.PageSize     `json:"page_size"`
++	Orientation   templates.Orientation  `json:"orientation"`
++	JSONSchemaURL string                 `json:"json_schema_url"`
++	ThumbnailURL  string                 `json:"thumbnail_url"`
++	ChangeSummary string                 `json:"change_summary"`
++}
++
++func (p TemplatePayload) ToTemplate() templates.Template {
++	return templates.Template{
++		Name:          strings.TrimSpace(p.Name),
++		Description:   strings.TrimSpace(p.Description),
++		DocumentType:  p.DocumentType,
++		PageSize:      p.PageSize,
++		Orientation:   p.Orientation,
++		JSONSchemaURL: strings.TrimSpace(p.JSONSchemaURL),
++		ThumbnailURL:  strings.TrimSpace(p.ThumbnailURL),
++	}
++}
++
++type DuplicatePayload struct {
++	CopyVersions        bool   `json:"copy_versions"`
++	NameOverride        string `json:"name_override"`
++	DescriptionOverride string `json:"description_override"`
++	CreatedBy           string `json:"created_by"`
++	UpdatedBy           string `json:"updated_by"`
++}
++
++func (p *DuplicatePayload) Defaults(userID string) {
++	if p.CreatedBy == "" {
++		p.CreatedBy = userID
++	}
++	if p.UpdatedBy == "" {
++		p.UpdatedBy = userID
++	}
++}
++
++type BulkIDsPayload struct {
++	TemplateIDs []string `json:"template_ids"`
++}
++
++type BulkDuplicatePayload struct {
++	TemplateIDs  []string `json:"template_ids"`
++	CopyVersions bool     `json:"copy_versions"`
++}
++
++type BulkResult struct {
++	Succeeded []string          `json:"succeeded"`
++	Failed    map[string]string `json:"failed"`
++}
++
++type contextKey string
++
++func withPathParam(ctx context.Context, key, value string) context.Context {
++	return context.WithValue(ctx, contextKey(key), value)
++}
++
++func pathParam(r *http.Request, key string) string {
++	if value, ok := r.Context().Value(contextKey(key)).(string); ok {
++		return value
++	}
++	return ""
++}
++
++func tenantFromRequest(r *http.Request) (string, error) {
++	tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
++	if tenantID == "" {
++		return "", errors.New("X-Tenant-ID header is required")
++	}
++	return tenantID, nil
++}
++
++func userFromRequest(r *http.Request) string {
++	userID := strings.TrimSpace(r.Header.Get("X-User-ID"))
++	if userID == "" {
++		return "system"
++	}
++	return userID
++}
++
++func paginationFromRequest(r *http.Request, defaultLimit int) (int, int) {
++	limit := defaultLimit
++	offset := 0
++	if v := r.URL.Query().Get("limit"); v != "" {
++		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
++			limit = parsed
++		}
++	}
++	if v := r.URL.Query().Get("offset"); v != "" {
++		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
++			offset = parsed
++		}
++	}
++	return limit, offset
++}
++
++func writeJSON(w http.ResponseWriter, status int, payload any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(payload)
++}
++
++func writeError(w http.ResponseWriter, status int, err error) {
++	writeJSON(w, status, map[string]string{"error": err.Error()})
++}
+diff --git a/internal/templates/id.go b/internal/templates/id.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..76715c9f55580f6899968dc5d49097ae1b2218b2
+--- /dev/null
++++ b/internal/templates/id.go
+@@ -0,0 +1,17 @@
++package templates
++
++import (
++	"crypto/rand"
++	"fmt"
++)
++
++// newID creates UUIDv4-like string without third party dependency.
++func newID() string {
++	b := make([]byte, 16)
++	if _, err := rand.Read(b); err != nil {
++		panic(fmt.Sprintf("failed to generate id: %v", err))
++	}
++	b[6] = (b[6] & 0x0f) | 0x40
++	b[8] = (b[8] & 0x3f) | 0x80
++	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
++}
+diff --git a/internal/templates/models.go b/internal/templates/models.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f63f6987048ee81f429648a7b3b0cdb6e4c6edf
+--- /dev/null
++++ b/internal/templates/models.go
+@@ -0,0 +1,131 @@
++package templates
++
++import (
++	"errors"
++	"strings"
++	"time"
++)
++
++// DocumentType enumerates supported document types.
++type DocumentType string
++
++const (
++	DocumentTypeWarranty    DocumentType = "warranty"
++	DocumentTypeInstruction DocumentType = "instruction"
++	DocumentTypeCertificate DocumentType = "certificate"
++	DocumentTypeLabel       DocumentType = "label"
++)
++
++// PageSize enumerates supported document sizes.
++type PageSize string
++
++const (
++	PageSizeA4     PageSize = "A4"
++	PageSizeA5     PageSize = "A5"
++	PageSizeLetter PageSize = "Letter"
++)
++
++// Orientation enumerates document orientation values.
++type Orientation string
++
++const (
++	OrientationPortrait  Orientation = "portrait"
++	OrientationLandscape Orientation = "landscape"
++)
++
++// Template represents the templates table structure.
++type Template struct {
++	TemplateID     string       `json:"template_id"`
++	TenantID       string       `json:"tenant_id"`
++	Name           string       `json:"name"`
++	Description    string       `json:"description"`
++	DocumentType   DocumentType `json:"document_type"`
++	PageSize       PageSize     `json:"page_size"`
++	Orientation    Orientation  `json:"orientation"`
++	JSONSchemaURL  string       `json:"json_schema_url"`
++	ThumbnailURL   string       `json:"thumbnail_url"`
++	Version        int          `json:"version"`
++	CreatedBy      string       `json:"created_by"`
++	UpdatedBy      string       `json:"updated_by"`
++	CreatedAt      time.Time    `json:"created_at"`
++	UpdatedAt      time.Time    `json:"updated_at"`
++	DeletedAt      *time.Time   `json:"deleted_at"`
++	DocumentsCount int          `json:"documents_count"`
++	LastUsedAt     *time.Time   `json:"last_used_at"`
++}
++
++// TemplateVersion represents the template_versions table structure.
++type TemplateVersion struct {
++	VersionID     string    `json:"version_id"`
++	TemplateID    string    `json:"template_id"`
++	VersionNumber int       `json:"version_number"`
++	ChangeSummary string    `json:"change_summary"`
++	JSONSchemaURL string    `json:"json_schema_url"`
++	CreatedBy     string    `json:"created_by"`
++	CreatedAt     time.Time `json:"created_at"`
++	IsCurrent     bool      `json:"is_current"`
++}
++
++var (
++	// ErrNotFound is returned when template or version does not exist.
++	ErrNotFound = errors.New("templates: resource not found")
++	// ErrConflict is returned when duplicated operations conflict.
++	ErrConflict = errors.New("templates: conflict detected")
++	// ErrInvalidInput indicates validation error.
++	ErrInvalidInput = errors.New("templates: invalid input")
++)
++
++// Validate ensures template structure is valid according to business rules.
++func (t Template) Validate() error {
++	if t.TenantID == "" {
++		return errors.New("tenant_id is required")
++	}
++	if len(strings.TrimSpace(t.Name)) < 3 || len(t.Name) > 100 {
++		return errors.New("name must be between 3 and 100 characters")
++	}
++	if len(t.Description) > 500 {
++		return errors.New("description must be <= 500 characters")
++	}
++	switch t.DocumentType {
++	case DocumentTypeWarranty, DocumentTypeInstruction, DocumentTypeCertificate, DocumentTypeLabel:
++	default:
++		return errors.New("document_type is invalid")
++	}
++	switch t.PageSize {
++	case PageSizeA4, PageSizeA5, PageSizeLetter:
++	default:
++		return errors.New("page_size is invalid")
++	}
++	switch t.Orientation {
++	case OrientationPortrait, OrientationLandscape:
++	default:
++		return errors.New("orientation is invalid")
++	}
++	if t.JSONSchemaURL == "" {
++		return errors.New("json_schema_url is required")
++	}
++	if t.CreatedBy == "" {
++		return errors.New("created_by is required")
++	}
++	if t.UpdatedBy == "" {
++		return errors.New("updated_by is required")
++	}
++	return nil
++}
++
++// Validate ensures template version business rules.
++func (tv TemplateVersion) Validate() error {
++	if tv.TemplateID == "" {
++		return errors.New("template_id is required")
++	}
++	if tv.VersionNumber <= 0 {
++		return errors.New("version_number must be positive")
++	}
++	if tv.JSONSchemaURL == "" {
++		return errors.New("json_schema_url is required")
++	}
++	if tv.CreatedBy == "" {
++		return errors.New("created_by is required")
++	}
++	return nil
++}
+diff --git a/internal/templates/repository.go b/internal/templates/repository.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cd9bb579046843b71a35320b0fabbfb126b1d31
+--- /dev/null
++++ b/internal/templates/repository.go
+@@ -0,0 +1,50 @@
++package templates
++
++import (
++	"context"
++)
++
++// ListOptions configure search and pagination behaviour.
++type ListOptions struct {
++	TenantID       string
++	Search         string
++	DocumentType   DocumentType
++	IncludeDeleted bool
++	Limit          int
++	Offset         int
++}
++
++// DuplicateOptions control template duplication behaviour.
++type DuplicateOptions struct {
++	CreatedBy           string
++	UpdatedBy           string
++	CopyVersions        bool
++	NameOverride        string
++	DescriptionOverride string
++}
++
++// Repository defines persistence layer for templates and versions.
++type Repository interface {
++	ListTemplates(ctx context.Context, opt ListOptions) ([]Template, error)
++	CountTemplates(ctx context.Context, opt ListOptions) (int, error)
++	GetTemplate(ctx context.Context, tenantID, templateID string) (*Template, error)
++	CreateTemplate(ctx context.Context, tpl Template) (*Template, error)
++	UpdateTemplate(ctx context.Context, tpl Template) (*Template, error)
++	SoftDeleteTemplate(ctx context.Context, tenantID, templateID string) error
++	RestoreTemplate(ctx context.Context, tenantID, templateID string) (*Template, error)
++	DuplicateTemplate(ctx context.Context, tenantID, templateID string, opt DuplicateOptions) (*Template, error)
++
++	ListVersions(ctx context.Context, tenantID, templateID string) ([]TemplateVersion, error)
++	CreateVersion(ctx context.Context, tenantID string, version TemplateVersion) (*TemplateVersion, error)
++	RestoreVersion(ctx context.Context, tenantID, templateID string, versionNumber int) (*TemplateVersion, error)
++	CompareVersions(ctx context.Context, tenantID, templateID string, left, right int) (*VersionComparison, error)
++}
++
++// VersionComparison describes the difference between two versions. For now it
++// only returns metadata but can be extended to include structural diff.
++type VersionComparison struct {
++	TemplateID string          `json:"template_id"`
++	Left       TemplateVersion `json:"left"`
++	Right      TemplateVersion `json:"right"`
++	Summary    string          `json:"summary"`
++}
+diff --git a/internal/templates/service.go b/internal/templates/service.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0432917bc47f05be12de97cc94e229608d6b72d5
+--- /dev/null
++++ b/internal/templates/service.go
+@@ -0,0 +1,436 @@
++package templates
++
++import (
++	"context"
++	"fmt"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++)
++
++// NewInMemoryRepository creates thread-safe repository for prototyping.
++func NewInMemoryRepository() Repository {
++	return &inMemoryRepository{
++		templates: make(map[string]Template),
++		versions:  make(map[string][]TemplateVersion),
++	}
++}
++
++// TemplateService orchestrates repository operations with validation and
++// business logic.
++type TemplateService struct {
++	repo Repository
++}
++
++// NewTemplateService creates service instance.
++func NewTemplateService(repo Repository) *TemplateService {
++	return &TemplateService{repo: repo}
++}
++
++// CreateTemplate handles validation and creation.
++func (s *TemplateService) CreateTemplate(ctx context.Context, tpl Template) (*Template, error) {
++	tpl.TemplateID = newID()
++	now := time.Now().UTC()
++	tpl.CreatedAt = now
++	tpl.UpdatedAt = now
++	tpl.Version = 1
++	if err := tpl.Validate(); err != nil {
++		return nil, fmt.Errorf("validate template: %w", err)
++	}
++	created, err := s.repo.CreateTemplate(ctx, tpl)
++	if err != nil {
++		return nil, err
++	}
++	version := TemplateVersion{
++		VersionID:     newID(),
++		TemplateID:    tpl.TemplateID,
++		VersionNumber: tpl.Version,
++		JSONSchemaURL: tpl.JSONSchemaURL,
++		ChangeSummary: "initial version",
++		CreatedBy:     tpl.CreatedBy,
++		CreatedAt:     now,
++		IsCurrent:     true,
++	}
++	if _, err := s.repo.CreateVersion(ctx, tpl.TenantID, version); err != nil {
++		return nil, err
++	}
++	return created, nil
++}
++
++// UpdateTemplate updates template metadata while incrementing version history.
++func (s *TemplateService) UpdateTemplate(ctx context.Context, tenantID, templateID string, mutate func(*Template) error, updatedBy string, changeSummary string) (*Template, error) {
++	tpl, err := s.repo.GetTemplate(ctx, tenantID, templateID)
++	if err != nil {
++		return nil, err
++	}
++	if tpl.DeletedAt != nil {
++		return nil, fmt.Errorf("template is deleted: %w", ErrInvalidInput)
++	}
++	if err := mutate(tpl); err != nil {
++		return nil, err
++	}
++	tpl.Version++
++	tpl.UpdatedBy = updatedBy
++	tpl.UpdatedAt = time.Now().UTC()
++	if err := tpl.Validate(); err != nil {
++		return nil, err
++	}
++	updated, err := s.repo.UpdateTemplate(ctx, *tpl)
++	if err != nil {
++		return nil, err
++	}
++	version := TemplateVersion{
++		VersionID:     newID(),
++		TemplateID:    tpl.TemplateID,
++		VersionNumber: tpl.Version,
++		JSONSchemaURL: tpl.JSONSchemaURL,
++		ChangeSummary: changeSummary,
++		CreatedBy:     updatedBy,
++		CreatedAt:     tpl.UpdatedAt,
++		IsCurrent:     true,
++	}
++	if _, err := s.repo.CreateVersion(ctx, tenantID, version); err != nil {
++		return nil, err
++	}
++	return updated, nil
++}
++
++// DuplicateTemplate duplicates template with optional version copy.
++func (s *TemplateService) DuplicateTemplate(ctx context.Context, tenantID, templateID string, opt DuplicateOptions) (*Template, error) {
++	tpl, err := s.repo.DuplicateTemplate(ctx, tenantID, templateID, opt)
++	if err != nil {
++		return nil, err
++	}
++	if opt.CopyVersions {
++		versions, err := s.repo.ListVersions(ctx, tenantID, templateID)
++		if err != nil {
++			return nil, err
++		}
++		for _, v := range versions {
++			v.TemplateID = tpl.TemplateID
++			v.VersionID = newID()
++			if v.IsCurrent {
++				v.VersionNumber = tpl.Version
++			}
++			if _, err := s.repo.CreateVersion(ctx, tenantID, v); err != nil {
++				return nil, err
++			}
++		}
++	}
++	return tpl, nil
++}
++
++// RestoreTemplate performs soft delete restoration.
++func (s *TemplateService) RestoreTemplate(ctx context.Context, tenantID, templateID string) (*Template, error) {
++	return s.repo.RestoreTemplate(ctx, tenantID, templateID)
++}
++
++// DeleteTemplate performs soft delete.
++func (s *TemplateService) DeleteTemplate(ctx context.Context, tenantID, templateID string) error {
++	return s.repo.SoftDeleteTemplate(ctx, tenantID, templateID)
++}
++
++// ListTemplates proxies listing operation.
++func (s *TemplateService) ListTemplates(ctx context.Context, opt ListOptions) ([]Template, int, error) {
++	items, err := s.repo.ListTemplates(ctx, opt)
++	if err != nil {
++		return nil, 0, err
++	}
++	count, err := s.repo.CountTemplates(ctx, opt)
++	if err != nil {
++		return nil, 0, err
++	}
++	return items, count, nil
++}
++
++// GetTemplate fetches template.
++func (s *TemplateService) GetTemplate(ctx context.Context, tenantID, templateID string) (*Template, error) {
++	return s.repo.GetTemplate(ctx, tenantID, templateID)
++}
++
++// Version helpers
++func (s *TemplateService) ListVersions(ctx context.Context, tenantID, templateID string) ([]TemplateVersion, error) {
++	return s.repo.ListVersions(ctx, tenantID, templateID)
++}
++
++func (s *TemplateService) RestoreVersion(ctx context.Context, tenantID, templateID string, versionNumber int) (*TemplateVersion, error) {
++	return s.repo.RestoreVersion(ctx, tenantID, templateID, versionNumber)
++}
++
++func (s *TemplateService) CompareVersions(ctx context.Context, tenantID, templateID string, left, right int) (*VersionComparison, error) {
++	return s.repo.CompareVersions(ctx, tenantID, templateID, left, right)
++}
++
++// inMemoryRepository is prototyping repository with maps.
++type inMemoryRepository struct {
++	templates map[string]Template
++	versions  map[string][]TemplateVersion
++	mu        sync.RWMutex
++}
++
++func (r *inMemoryRepository) withTenantTemplates(tenantID string) []Template {
++	var res []Template
++	for _, tpl := range r.templates {
++		if tpl.TenantID == tenantID {
++			res = append(res, tpl)
++		}
++	}
++	return res
++}
++
++func (r *inMemoryRepository) ListTemplates(ctx context.Context, opt ListOptions) ([]Template, error) {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	var result []Template
++	search := strings.ToLower(strings.TrimSpace(opt.Search))
++	for _, tpl := range r.templates {
++		if tpl.TenantID != opt.TenantID {
++			continue
++		}
++		if !opt.IncludeDeleted && tpl.DeletedAt != nil {
++			continue
++		}
++		if opt.DocumentType != "" && tpl.DocumentType != opt.DocumentType {
++			continue
++		}
++		if search != "" && !strings.Contains(strings.ToLower(tpl.Name), search) && !strings.Contains(strings.ToLower(tpl.Description), search) {
++			continue
++		}
++		result = append(result, tpl)
++	}
++	sort.Slice(result, func(i, j int) bool {
++		return result[i].UpdatedAt.After(result[j].UpdatedAt)
++	})
++	start := opt.Offset
++	if start > len(result) {
++		return []Template{}, nil
++	}
++	end := start + opt.Limit
++	if opt.Limit <= 0 || end > len(result) {
++		end = len(result)
++	}
++	return append([]Template(nil), result[start:end]...), nil
++}
++
++func (r *inMemoryRepository) CountTemplates(ctx context.Context, opt ListOptions) (int, error) {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	count := 0
++	search := strings.ToLower(strings.TrimSpace(opt.Search))
++	for _, tpl := range r.templates {
++		if tpl.TenantID != opt.TenantID {
++			continue
++		}
++		if !opt.IncludeDeleted && tpl.DeletedAt != nil {
++			continue
++		}
++		if opt.DocumentType != "" && tpl.DocumentType != opt.DocumentType {
++			continue
++		}
++		if search != "" && !strings.Contains(strings.ToLower(tpl.Name), search) && !strings.Contains(strings.ToLower(tpl.Description), search) {
++			continue
++		}
++		count++
++	}
++	return count, nil
++}
++
++func (r *inMemoryRepository) GetTemplate(ctx context.Context, tenantID, templateID string) (*Template, error) {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	tpl, ok := r.templates[templateID]
++	if !ok || tpl.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	clone := tpl
++	return &clone, nil
++}
++
++func (r *inMemoryRepository) CreateTemplate(ctx context.Context, tpl Template) (*Template, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if _, exists := r.templates[tpl.TemplateID]; exists {
++		return nil, ErrConflict
++	}
++	r.templates[tpl.TemplateID] = tpl
++	clone := tpl
++	return &clone, nil
++}
++
++func (r *inMemoryRepository) UpdateTemplate(ctx context.Context, tpl Template) (*Template, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	existing, ok := r.templates[tpl.TemplateID]
++	if !ok || existing.TenantID != tpl.TenantID {
++		return nil, ErrNotFound
++	}
++	r.templates[tpl.TemplateID] = tpl
++	clone := tpl
++	return &clone, nil
++}
++
++func (r *inMemoryRepository) SoftDeleteTemplate(ctx context.Context, tenantID, templateID string) error {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	tpl, ok := r.templates[templateID]
++	if !ok || tpl.TenantID != tenantID {
++		return ErrNotFound
++	}
++	now := time.Now().UTC()
++	tpl.DeletedAt = &now
++	r.templates[templateID] = tpl
++	return nil
++}
++
++func (r *inMemoryRepository) RestoreTemplate(ctx context.Context, tenantID, templateID string) (*Template, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	tpl, ok := r.templates[templateID]
++	if !ok || tpl.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	tpl.DeletedAt = nil
++	r.templates[templateID] = tpl
++	clone := tpl
++	return &clone, nil
++}
++
++func (r *inMemoryRepository) DuplicateTemplate(ctx context.Context, tenantID, templateID string, opt DuplicateOptions) (*Template, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	tpl, ok := r.templates[templateID]
++	if !ok || tpl.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	now := time.Now().UTC()
++	clone := tpl
++	clone.TemplateID = newID()
++	clone.CreatedAt = now
++	clone.UpdatedAt = now
++	clone.CreatedBy = opt.CreatedBy
++	clone.UpdatedBy = opt.UpdatedBy
++	clone.DeletedAt = nil
++	clone.DocumentsCount = 0
++	clone.LastUsedAt = nil
++	clone.Version = 1
++	if opt.NameOverride != "" {
++		clone.Name = opt.NameOverride
++	} else {
++		clone.Name = fmt.Sprintf("%s Copy", tpl.Name)
++	}
++	if opt.DescriptionOverride != "" {
++		clone.Description = opt.DescriptionOverride
++	}
++	if err := clone.Validate(); err != nil {
++		return nil, err
++	}
++	if _, exists := r.templates[clone.TemplateID]; exists {
++		return nil, ErrConflict
++	}
++	r.templates[clone.TemplateID] = clone
++	version := TemplateVersion{
++		VersionID:     newID(),
++		TemplateID:    clone.TemplateID,
++		VersionNumber: clone.Version,
++		JSONSchemaURL: clone.JSONSchemaURL,
++		ChangeSummary: "duplicated from " + tpl.TemplateID,
++		CreatedBy:     opt.UpdatedBy,
++		CreatedAt:     now,
++		IsCurrent:     true,
++	}
++	r.versions[clone.TemplateID] = append(r.versions[clone.TemplateID], version)
++	dup := clone
++	return &dup, nil
++}
++
++func (r *inMemoryRepository) ListVersions(ctx context.Context, tenantID, templateID string) ([]TemplateVersion, error) {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	tpl, ok := r.templates[templateID]
++	if !ok || tpl.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	versions := r.versions[templateID]
++	return append([]TemplateVersion(nil), versions...), nil
++}
++
++func (r *inMemoryRepository) CreateVersion(ctx context.Context, tenantID string, version TemplateVersion) (*TemplateVersion, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	tpl, ok := r.templates[version.TemplateID]
++	if !ok || tpl.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	if err := version.Validate(); err != nil {
++		return nil, err
++	}
++	for i := range r.versions[version.TemplateID] {
++		r.versions[version.TemplateID][i].IsCurrent = false
++	}
++	r.versions[version.TemplateID] = append(r.versions[version.TemplateID], version)
++	clone := version
++	return &clone, nil
++}
++
++func (r *inMemoryRepository) RestoreVersion(ctx context.Context, tenantID, templateID string, versionNumber int) (*TemplateVersion, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	tpl, ok := r.templates[templateID]
++	if !ok || tpl.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	versions := r.versions[templateID]
++	var restored *TemplateVersion
++	for i := range versions {
++		if versions[i].VersionNumber == versionNumber {
++			restored = &versions[i]
++			break
++		}
++	}
++	if restored == nil {
++		return nil, ErrNotFound
++	}
++	tpl.JSONSchemaURL = restored.JSONSchemaURL
++	tpl.Version++
++	tpl.UpdatedAt = time.Now().UTC()
++	tpl.UpdatedBy = restored.CreatedBy
++	r.templates[templateID] = tpl
++	clone := *restored
++	clone.IsCurrent = true
++	clone.VersionNumber = tpl.Version
++	clone.CreatedAt = tpl.UpdatedAt
++	r.versions[templateID] = append(r.versions[templateID], clone)
++	return &clone, nil
++}
++
++func (r *inMemoryRepository) CompareVersions(ctx context.Context, tenantID, templateID string, left, right int) (*VersionComparison, error) {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	tpl, ok := r.templates[templateID]
++	if !ok || tpl.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	var leftVersion, rightVersion *TemplateVersion
++	for i := range r.versions[templateID] {
++		version := r.versions[templateID][i]
++		switch version.VersionNumber {
++		case left:
++			tmp := version
++			leftVersion = &tmp
++		case right:
++			tmp := version
++			rightVersion = &tmp
++		}
++	}
++	if leftVersion == nil || rightVersion == nil {
++		return nil, ErrNotFound
++	}
++	summary := fmt.Sprintf("left schema: %s, right schema: %s", leftVersion.JSONSchemaURL, rightVersion.JSONSchemaURL)
++	return &VersionComparison{
++		TemplateID: tpl.TemplateID,
++		Left:       *leftVersion,
++		Right:      *rightVersion,
++		Summary:    summary,
++	}, nil
++}
+ 
+EOF
+)
